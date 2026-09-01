@@ -1,21 +1,18 @@
 /**
  * The right-side flyout: all the juicy details for a clicked node, organized
  * as collapsible sections — Knowledge node (identity + counts), Knowledge records (the node's
- * records with clickable [[wikilinks]]), and a per-knowledge record drill-in with full
- * provenance including the capture agent's reasoning (`metadata.reason`) and
- * the "captured in session" link that opens the thread view (Amendment A2).
+ * records with clickable [[wikilinks]]), and a per-record drill-in with
+ * filtered provenance and capture reasoning.
  */
 
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@mastra/playground-ui/components/Collapsible';
 import { Notice } from '@mastra/playground-ui/components/Notice';
-import { ChevronDown, ExternalLink, Pin, Sparkles, X } from 'lucide-react';
+import { ChevronDown, Pin, Sparkles, X } from 'lucide-react';
 import { useEffect, useRef } from 'react';
 
 import { useKnowledgeNode } from '../../../../../hooks/useKnowledgeGraph';
-import type { KnowledgeNodeRecord, KnowledgeRung } from '../../services/knowledge';
+import type { KnowledgeNodeRecord } from '../../services/knowledge';
 import { parseRecordSegments } from './recordText';
-
-const RUNG_LABELS: Record<KnowledgeRung, string> = { org: 'Org', resource: 'Project', thread: 'Session' };
 
 function SectionHeader({ title, count }: { title: string; count?: number }) {
   return (
@@ -29,14 +26,6 @@ function SectionHeader({ title, count }: { title: string; count?: number }) {
         className="text-muted-foreground ml-auto transition-transform group-data-[state=open]:rotate-180"
       />
     </CollapsibleTrigger>
-  );
-}
-
-function RungBadge({ rung }: { rung: KnowledgeRung }) {
-  return (
-    <span className="bg-badge-purple-strong text-badge-purple-foreground rounded px-1.5 py-0.5 text-[10px] font-medium">
-      {RUNG_LABELS[rung].toLowerCase()}
-    </span>
   );
 }
 
@@ -79,7 +68,6 @@ function RecordCard({
   expanded,
   onToggle,
   onNodeRef,
-  onOpenThread,
 }: {
   record: KnowledgeNodeRecord;
   /**
@@ -91,7 +79,6 @@ function RecordCard({
   expanded: boolean;
   onToggle: () => void;
   onNodeRef?: (name: string) => void;
-  onOpenThread?: (threadId: string) => void;
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -101,8 +88,7 @@ function RecordCard({
       cardRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
     }
   }, [expanded]);
-  const reason = typeof record.metadata?.reason === 'string' ? record.metadata.reason : undefined;
-  const otherMetadata = Object.entries(record.metadata ?? {}).filter(([key]) => key !== 'reason');
+  const reason = record.reason;
   return (
     <div
       ref={cardRef}
@@ -141,39 +127,21 @@ function RecordCard({
           ) : null}
         </div>
         <div className="text-muted-foreground mt-1.5 flex items-center gap-2 text-[10px]">
-          <RungBadge rung={record.rung} />
           {record.relation === 'mentions' ? <span className="text-muted-foreground">mentions</span> : null}
-          <span>captured {relativeTime(record.capturedAt)}</span>
+          <span>created {relativeTime(record.createdAt)}</span>
         </div>
       </div>
       {expanded ? (
         <div data-testid="knowledge-record-detail" className="border-border border-t px-3 py-2.5 text-[11px]">
           <dl className="text-muted-foreground grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1">
-            <dt>Captured in session</dt>
-            <dd>
-              {record.sourceThreadId ? (
-                <button
-                  type="button"
-                  className="text-badge-purple-indicator flex items-center gap-1 hover:underline"
-                  onClick={() => onOpenThread?.(record.sourceThreadId)}
-                >
-                  <span className="max-w-40 truncate">{record.sourceThreadId}</span>
-                  <ExternalLink size={10} />
-                </button>
-              ) : (
-                '—'
-              )}
-            </dd>
-            <dt>Captured at</dt>
-            <dd>{new Date(record.capturedAt).toLocaleString()}</dd>
+            <dt>Created at</dt>
+            <dd>{new Date(record.createdAt).toLocaleString()}</dd>
             {record.when ? (
               <>
                 <dt>When</dt>
                 <dd>{record.when}</dd>
               </>
             ) : null}
-            <dt>Scope chain</dt>
-            <dd className="break-all">{record.scope.join(' → ')}</dd>
             <dt>Pinned</dt>
             <dd>{record.pinned ? 'yes' : 'no'}</dd>
           </dl>
@@ -192,16 +160,6 @@ function RecordCard({
               No capture reasoning was recorded for this knowledge record.
             </p>
           )}
-          {otherMetadata.length > 0 ? (
-            <dl className="text-muted-foreground mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[10px]">
-              {otherMetadata.map(([key, value]) => (
-                <div key={key} className="contents">
-                  <dt>{key}</dt>
-                  <dd className="break-all">{typeof value === 'string' ? value : JSON.stringify(value)}</dd>
-                </div>
-              ))}
-            </dl>
-          ) : null}
         </div>
       ) : null}
     </div>
@@ -211,7 +169,7 @@ function RecordCard({
 export interface KnowledgeFlyoutProps {
   factoryProjectId: string;
   nodeId: string;
-  scopeLevel: KnowledgeRung;
+  scopeId: string;
   threadId?: string;
   /** Highlight the knowledge record backing a clicked edge. */
   focusRecordId?: string;
@@ -219,21 +177,19 @@ export interface KnowledgeFlyoutProps {
   onSelectRecord?: (recordId: string | null) => void;
   onClose: () => void;
   onNodeRef?: (name: string) => void;
-  onOpenThread?: (threadId: string) => void;
 }
 
 export function KnowledgeFlyout({
   factoryProjectId,
   nodeId,
-  scopeLevel,
+  scopeId,
   threadId,
   focusRecordId,
   onSelectRecord,
   onClose,
   onNodeRef,
-  onOpenThread,
 }: KnowledgeFlyoutProps) {
-  const nodeQuery = useKnowledgeNode(factoryProjectId, nodeId, scopeLevel, threadId);
+  const nodeQuery = useKnowledgeNode(factoryProjectId, nodeId, scopeId, threadId);
 
   return (
     <aside
@@ -256,7 +212,6 @@ export function KnowledgeFlyout({
                 <span className="bg-fill text-muted-foreground rounded px-1.5 py-0.5 text-[10px]">
                   {nodeQuery.data.node.kind}
                 </span>
-                <RungBadge rung={nodeQuery.data.node.rung} />
               </div>
             </div>
             <button
@@ -271,14 +226,11 @@ export function KnowledgeFlyout({
 
           <div className="min-h-0 flex-1 overflow-y-auto pb-4">
             {nodeQuery.data.node.description?.trim() ? (
-              <p className="text-foreground px-4 pb-3 text-sm leading-relaxed">{nodeQuery.data.node.description}</p>
-            ) : null}
-            {nodeQuery.data.node.content.trim() ? (
               <Collapsible defaultOpen>
-                <SectionHeader title="Content" />
+                <SectionHeader title="Description" />
                 <CollapsibleContent>
                   <p className="text-foreground px-4 pb-3 text-xs leading-relaxed break-words whitespace-pre-wrap">
-                    <RecordText text={nodeQuery.data.node.content} onNodeRef={onNodeRef} />
+                    <RecordText text={nodeQuery.data.node.description} onNodeRef={onNodeRef} />
                   </p>
                 </CollapsibleContent>
               </Collapsible>
@@ -290,8 +242,6 @@ export function KnowledgeFlyout({
                 <dl className="text-muted-foreground grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 px-4 pb-3 text-xs">
                   <dt>Kind</dt>
                   <dd className="text-foreground text-right">{nodeQuery.data.node.kind}</dd>
-                  <dt>Scope</dt>
-                  <dd className="text-foreground text-right break-all">{nodeQuery.data.node.scope.join(' → ')}</dd>
                   <dt>Created</dt>
                   <dd className="text-foreground text-right">
                     {new Date(nodeQuery.data.node.createdAt).toLocaleString()}
@@ -325,7 +275,6 @@ export function KnowledgeFlyout({
                           expanded={record.id === focusRecordId}
                           onToggle={() => onSelectRecord?.(record.id === focusRecordId ? null : record.id)}
                           onNodeRef={onNodeRef}
-                          onOpenThread={onOpenThread}
                         />
                       </div>
                     ))
