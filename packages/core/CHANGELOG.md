@@ -1,5 +1,11 @@
 # @mastra/core
 
+## 1.75.0-alpha.7
+
+### Patch Changes
+
+- Fixed thread streams treating a run as finished while it was still waiting for a tool approval or a suspended tool. When thread updates were delivered with a delay (for example with `@mastra/redis-streams`), the thread could unblock and subscribers on other servers could lose the pending approval. The run now stays waiting until the approval or tool resumes it. ([#25962](https://github.com/mastra-ai/mastra/pull/25962))
+
 ## 1.75.0-alpha.6
 
 ### Patch Changes

@@ -1,5 +1,95 @@
 # @mastra/playground-ui
 
+## 61.0.0-alpha.7
+
+### Minor Changes
+
+- Improved tool approvals in Factory and Studio. Both now show the decision as a status badge beside the tool name and preview the complete file content before you approve. Pending requests stay expanded so the actions stay visible; once decided, Studio details can collapse without hiding the decision. ([#25951](https://github.com/mastra-ai/mastra/pull/25951))
+
+  **Changed** `ToolApprovalActions` now renders only the Approve and Decline buttons and no longer accepts `status`. Render it only while the request is pending, and show the decision with the new `ToolApprovalStatus` beside the tool name.
+
+  Before:
+
+  ```tsx
+  <ToolApprovalActions status={decision} toolName="write_file" onApprove={approve} onDecline={decline} />
+  ```
+
+  After:
+
+  ```tsx
+  <>
+    <ToolApprovalStatus status={decision} />
+    {!decision && <ToolApprovalActions toolName="write_file" onApprove={approve} onDecline={decline} />}
+  </>
+  ```
+
+  `ToolApproval` renders both parts for you and now accepts `args` to preview the tool arguments.
+
+  **Removed** `ToolApprovalButtons` from `@mastra/playground-ui/domains/chat/tools/badges/tool-approval-buttons`. Wrap the tool's details in `ToolApprovalBadge` from `@mastra/playground-ui/domains/chat/tools/badges/tool-approval-badge` instead: it takes the tool's `BadgeWrapper` props plus the approval request, shows the status beside the tool name, and keeps the request expanded until it is decided. `ToolApprovalButtonsProps` is now `ToolApprovalRequest`.
+
+  Before:
+
+  ```tsx
+  <BadgeWrapper title="Write file">
+    {details}
+    <ToolApprovalButtons {...request} />
+  </BadgeWrapper>
+  ```
+
+  After:
+
+  ```tsx
+  <ToolApprovalBadge title="Write file" approval={request}>
+    {details}
+  </ToolApprovalBadge>
+  ```
+
+- **Text roles** ([#25827](https://github.com/mastra-ai/mastra/pull/25827))
+
+  Added shared headline, introduction, and uppercase section-label roles to Txt:
+
+  ```tsx
+  <Txt as="h1" variant="hero">Welcome</Txt>
+  <Txt variant="lead">Introduction</Txt>
+  <Txt as="span" variant="eyebrow">Recent activity</Txt>
+  ```
+
+  **Text elements and component ownership**
+
+  Txt supports text elements only; native containers and controls retain their markup, default typography, and child composition.
+
+  Migrate text-only div usages to paragraphs:
+
+  ```tsx
+  // Before
+  <Txt as="div" variant="body">Content</Txt>
+
+  // After
+  <Txt as="p" variant="body">Content</Txt>
+  ```
+
+  Keep a native layout wrapper for controls or multiple blocks. Use Code for preformatted code and Txt at the text leaf. Shared components continue to own their typography through existing size and semantic variants, without generic text-role forwarding props. Command groups retain compact uppercase headings.
+
+  **Editor fonts**
+
+  CodeEditor accepts `font="body"` for prose editors and defaults to `font="mono"` for code.
+
+- Added `DataList.Group` for blocks of rows that share the list's columns but keep their own hover. A group's row lights only while the pointer is on it or in the gap between two of the group's rows. Headings, buttons, empty states and padding around the rows stay dark, and the highlight never jumps to another group. ([#25947](https://github.com/mastra-ai/mastra/pull/25947))
+
+  ```tsx
+  <DataList columns="auto 1fr auto">
+    <DataList.Group aria-label="Open">{openRows}</DataList.Group>
+    <DataList.Group aria-label="Closed">{closedRows}</DataList.Group>
+  </DataList>
+  ```
+
+### Patch Changes
+
+- Updated dependencies [[`c498e24`](https://github.com/mastra-ai/mastra/commit/c498e249038d08a2e2fc31eed7ba4ca5e7fa1aa8)]:
+  - @mastra/core@1.75.0-alpha.7
+  - @mastra/client-js@1.52.0-alpha.7
+  - @mastra/react@1.8.0-alpha.7
+
 ## 61.0.0-alpha.6
 
 ### Patch Changes
