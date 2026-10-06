@@ -165,14 +165,36 @@ async function startLogin(auth: any, claims: Record<string, unknown> = {}, state
   const loginUrl = new URL(await auth.getLoginUrl(REDIRECT_URI, state));
   const nonce = loginUrl.searchParams.get('nonce')!;
   idTokenClaims = { sub: 'user-42', nonce, ...claims };
+
+  // What the browser stores from the login response.
+  const loginCookies: string[] = auth.getLoginCookies(REDIRECT_URI, state) ?? [];
+  const browserCookies = loginCookies.map(c => c.split(';')[0]).join('; ');
+
   // The Mastra server splits the state on `|` and forwards only the first part.
-  return { loginUrl, nonce, stateId: loginUrl.searchParams.get('state')!.split('|')[0]! };
+  const stateId = loginUrl.searchParams.get('state')!.split('|')[0]!;
+
+  /**
+   * Replay what packages/server does on the callback request: hand the
+   * provider the request's Cookie header, then exchange the code.
+   */
+  const callback = (code = 'auth-code', callbackState = stateId, cookieHeader: string | null = browserCookies) => {
+    auth.setCallbackCookieHeader(cookieHeader || null);
+    return auth.handleCallback(code, callbackState);
+  };
+
+  return { loginUrl, nonce, stateId, loginCookies, browserCookies, callback };
+}
+
+/** A callback arriving at a provider that never issued a login cookie. */
+function callbackWithoutLogin(auth: any, code: string, state: string) {
+  auth.setCallbackCookieHeader(null);
+  return auth.handleCallback(code, state);
 }
 
 describe('MastraAuthOidc against a live OpenID Provider', () => {
   it('completes the login flow and authenticates the resulting session cookie', async () => {
     const auth = createAuth();
-    const { loginUrl, stateId } = await startLogin(auth, {
+    const { loginUrl, stateId, callback } = await startLogin(auth, {
       email: 'ada@example.com',
       email_verified: true,
       name: 'Ada Lovelace',
@@ -188,7 +210,7 @@ describe('MastraAuthOidc against a live OpenID Provider', () => {
     // The server's post-login redirect suffix survives the round trip.
     expect(loginUrl.searchParams.get('state')!.endsWith('|%2Fagents')).toBe(true);
 
-    const result = await auth.handleCallback('auth-code', stateId);
+    const result = await callback();
 
     expect(lastTokenRequest?.get('grant_type')).toBe('authorization_code');
     expect(lastTokenRequest?.get('redirect_uri')).toBe(REDIRECT_URI);
@@ -229,13 +251,13 @@ describe('MastraAuthOidc against a live OpenID Provider', () => {
 
   it('sends PKCE when the provider advertises S256', async () => {
     const auth = createAuth();
-    const { loginUrl, stateId } = await startLogin(auth);
+    const { loginUrl, stateId, callback } = await startLogin(auth);
 
     const challenge = loginUrl.searchParams.get('code_challenge');
     expect(challenge).toBeTruthy();
     expect(loginUrl.searchParams.get('code_challenge_method')).toBe('S256');
 
-    await auth.handleCallback('auth-code', stateId);
+    await callback();
 
     const verifier = lastTokenRequest?.get('code_verifier');
     expect(verifier).toBeTruthy();
@@ -245,19 +267,19 @@ describe('MastraAuthOidc against a live OpenID Provider', () => {
   it('omits PKCE when the provider does not advertise it', async () => {
     advertisePKCE = false;
     const auth = createAuth();
-    const { loginUrl, stateId } = await startLogin(auth);
+    const { loginUrl, stateId, callback } = await startLogin(auth);
 
     expect(loginUrl.searchParams.get('code_challenge')).toBeNull();
 
-    await auth.handleCallback('auth-code', stateId);
+    await callback();
     expect(lastTokenRequest?.get('code_verifier')).toBeNull();
   });
 
   it('authenticates with client_secret_basic when configured', async () => {
     const auth = createAuth({ tokenEndpointAuthMethod: 'client_secret_basic' });
-    const { stateId } = await startLogin(auth);
+    const { stateId, callback } = await startLogin(auth);
 
-    await auth.handleCallback('auth-code', stateId);
+    await callback();
 
     // Basic auth moves the credentials out of the body and into the header.
     expect(lastTokenRequest?.get('client_secret')).toBeNull();
@@ -280,37 +302,96 @@ describe('MastraAuthOidc against a live OpenID Provider', () => {
 
   it('rejects a malformed state', async () => {
     const auth = createAuth();
-    await expect(auth.handleCallback('auth-code', 'not-a-state')).rejects.toThrow();
+    await expect(callbackWithoutLogin(auth, 'auth-code', 'not-a-state')).rejects.toThrow();
   });
 
   it('rejects a state sealed with a different cookie password', async () => {
-    const { stateId } = await startLogin(createAuth());
+    const { stateId, browserCookies } = await startLogin(createAuth());
     const other = createAuth({ session: { cookiePassword: `other-${COOKIE_PASSWORD}` } });
 
+    other.setCallbackCookieHeader(browserCookies);
     await expect(other.handleCallback('auth-code', stateId)).rejects.toThrow();
   });
 
   it('rejects a swapped post-login redirect suffix', async () => {
     const auth = createAuth();
-    const { stateId } = await startLogin(auth);
+    const { stateId, callback } = await startLogin(auth);
 
-    await expect(auth.handleCallback('auth-code', `${stateId}|%2F%2Fevil.example.com`)).rejects.toThrow(
+    // Note: the Mastra server splits the state on `|` and forwards only the
+    // first part, so it owns redirect validation and this guard never fires
+    // there. It covers hosts that pass the state through untouched.
+    await expect(callback('auth-code', `${stateId}|%2F%2Fevil.example.com`)).rejects.toThrow(
       'Invalid state redirect suffix',
     );
   });
 
+  describe('login binding to the initiating browser', () => {
+    it('issues a login cookie and clears it once the callback completes', async () => {
+      const auth = createAuth();
+      const { loginCookies, callback } = await startLogin(auth);
+
+      expect(loginCookies).toHaveLength(1);
+      expect(loginCookies[0]).toContain('oidc_session_login=');
+      expect(loginCookies[0]).toContain('HttpOnly');
+      expect(loginCookies[0]).toContain('SameSite=Lax');
+
+      const { cookies } = await callback();
+      expect(cookies.some((c: string) => c.startsWith('oidc_session_login=;') && c.includes('Max-Age=0'))).toBe(true);
+    });
+
+    it('rejects a callback from a browser that never started the login', async () => {
+      const auth = createAuth();
+      const { callback } = await startLogin(auth);
+
+      // The victim's browser holds no login cookie for the attacker's state.
+      await expect(callback('auth-code', undefined, null)).rejects.toThrow('not started in this browser');
+    });
+
+    it('rejects a callback carrying a different login attempt', async () => {
+      const auth = createAuth();
+      const victim = await startLogin(auth);
+      const attacker = await startLogin(auth);
+
+      // Attacker's code and state, replayed into the victim's browser.
+      await expect(attacker.callback('auth-code', attacker.stateId, victim.browserCookies)).rejects.toThrow(
+        'not started in this browser',
+      );
+    });
+
+    it('bounds in-flight logins when a host never reads the login cookie', async () => {
+      const auth = createAuth();
+      // Drive getLoginUrl past the cap without ever calling getLoginCookies.
+      for (let i = 0; i < 105; i++) {
+        await auth.getLoginUrl(REDIRECT_URI, `state-${i}|%2F`);
+      }
+
+      expect(auth.pendingBindings.size).toBeLessThanOrEqual(100);
+      // The most recent login is still completable.
+      expect(auth.getLoginCookies(REDIRECT_URI, 'state-104|%2F')).toHaveLength(1);
+    });
+
+    it('rejects a callback whose login cookie was tampered with', async () => {
+      const auth = createAuth();
+      const { callback } = await startLogin(auth);
+
+      await expect(callback('auth-code', undefined, 'oidc_session_login=guessed-value')).rejects.toThrow(
+        'not started in this browser',
+      );
+    });
+  });
+
   it('rejects an ID token whose nonce does not match', async () => {
     const auth = createAuth();
-    const { stateId } = await startLogin(auth, { nonce: 'wrong-nonce' });
+    const { stateId, callback } = await startLogin(auth, { nonce: 'wrong-nonce' });
 
-    await expect(auth.handleCallback('auth-code', stateId)).rejects.toThrow();
+    await expect(callback()).rejects.toThrow();
   });
 
   it('surfaces token endpoint errors', async () => {
     const auth = createAuth();
-    const { stateId } = await startLogin(auth);
+    const { stateId, callback } = await startLogin(auth);
 
-    await expect(auth.handleCallback('wrong-code', stateId)).rejects.toThrow();
+    await expect(callback('wrong-code')).rejects.toThrow();
   });
 
   it('verifies a real Bearer token signed by the provider', async () => {
@@ -452,8 +533,8 @@ describe('MastraAuthOidc against a live OpenID Provider', () => {
   describe('session cookie handling', () => {
     /** Log in and return the `Cookie` header value for the new session. */
     async function login(auth: any) {
-      const { stateId } = await startLogin(auth);
-      const { cookies } = await auth.handleCallback('auth-code', stateId);
+      const { stateId, callback } = await startLogin(auth);
+      const { cookies } = await callback();
       return { cookie: cookies[0].split(';')[0] as string, setCookie: cookies[0] as string };
     }
 
@@ -483,7 +564,7 @@ describe('MastraAuthOidc against a live OpenID Provider', () => {
 
       // Must fail the purpose check while unsealing, not later on a malformed
       // field, so the two token types can never be swapped for one another.
-      await expect(auth.handleCallback('auth-code', sealedSession)).rejects.toThrow('aud');
+      await expect(callbackWithoutLogin(auth, 'auth-code', sealedSession)).rejects.toThrow('aud');
     });
 
     it('rejects an expired session cookie', async () => {
@@ -531,6 +612,38 @@ describe('MastraAuthOidc against a live OpenID Provider', () => {
       await expect(auth.authenticateToken('', request)).resolves.toMatchObject({ id: 'user-42' });
     });
 
+    it('keeps the cookie under the browser size limit for a fat ID token', async () => {
+      const auth = createAuth();
+      // Keycloak and Entra ID routinely put long group/role lists in the token.
+      const groups = Array.from({ length: 40 }, (_, i) => `/acme/engineering/platform/team-alpha/subgroup-${i}`);
+      const { callback } = await startLogin(auth, { groups });
+
+      const { cookies } = await callback();
+      const sessionCookie = cookies[0] as string;
+
+      expect(sessionCookie.length).toBeLessThan(4096);
+
+      // The session still authenticates; only the logout hint is sacrificed.
+      const request = new Request('http://localhost', { headers: { Cookie: sessionCookie.split(';')[0]! } });
+      await expect(auth.authenticateToken('', request)).resolves.toMatchObject({ id: 'user-42' });
+
+      const logoutUrl = new URL(await auth.getLogoutUrl('http://localhost:4111/', request));
+      expect(logoutUrl.searchParams.get('id_token_hint')).toBeNull();
+    });
+
+    it('fails loudly when the mapped user alone cannot fit in a cookie', async () => {
+      const auth = createAuth({
+        mapClaims: (payload: any) => ({
+          id: payload.sub,
+          sub: payload.sub,
+          groups: Array.from({ length: 400 }, (_, i) => `/acme/engineering/platform/team-alpha/subgroup-${i}`),
+        }),
+      });
+      const { callback } = await startLogin(auth);
+
+      await expect(callback()).rejects.toThrow('over the 4096-byte browser limit');
+    });
+
     it('ignores a request with no cookie at all', async () => {
       const auth = createAuth();
       await expect(auth.authenticateToken('', new Request('http://localhost'))).resolves.toBeNull();
@@ -570,13 +683,13 @@ describe('MastraAuthOidc against a live OpenID Provider', () => {
   describe('OAuth state handling', () => {
     it('rejects an expired state token', async () => {
       const auth = createAuth();
-      const { stateId } = await startLogin(auth);
+      const { stateId, callback } = await startLogin(auth);
 
       vi.useFakeTimers({ toFake: ['Date'] });
       try {
         // The state is good for 10 minutes.
         vi.setSystemTime(Date.now() + 11 * 60 * 1000);
-        await expect(auth.handleCallback('auth-code', stateId)).rejects.toThrow();
+        await expect(callback()).rejects.toThrow();
       } finally {
         vi.useRealTimers();
       }
@@ -584,55 +697,56 @@ describe('MastraAuthOidc against a live OpenID Provider', () => {
 
     it('rejects a replayed authorization code', async () => {
       const auth = createAuth();
-      const { stateId } = await startLogin(auth);
+      const { stateId, callback } = await startLogin(auth);
 
-      await expect(auth.handleCallback('auth-code', stateId)).resolves.toBeDefined();
+      await expect(callback()).resolves.toBeDefined();
       // The provider burns the code, so replaying the same state and code fails.
-      await expect(auth.handleCallback('auth-code', stateId)).rejects.toThrow();
+      await expect(callback()).rejects.toThrow();
     });
 
     it('rejects a state token issued by a different provider instance', async () => {
-      const { stateId } = await startLogin(createAuth());
+      const { stateId, browserCookies } = await startLogin(createAuth());
       const other = createAuth({ session: { cookiePassword: `other-${COOKIE_PASSWORD}` } });
 
+      other.setCallbackCookieHeader(browserCookies);
       await expect(other.handleCallback('auth-code', stateId)).rejects.toThrow();
     });
 
     it('rejects an ID token with no nonce', async () => {
       const auth = createAuth();
-      const { stateId } = await startLogin(auth);
+      const { stateId, callback } = await startLogin(auth);
       idTokenClaims = { sub: 'user-42' };
 
-      await expect(auth.handleCallback('auth-code', stateId)).rejects.toThrow();
+      await expect(callback()).rejects.toThrow();
     });
 
     it('rejects a login when a custom mapClaims yields no subject', async () => {
       const auth = createAuth({ mapClaims: () => ({ id: '', sub: '' }) });
-      const { stateId } = await startLogin(auth);
+      const { stateId, callback } = await startLogin(auth);
 
-      await expect(auth.handleCallback('auth-code', stateId)).rejects.toThrow('missing a subject');
+      await expect(callback()).rejects.toThrow('missing a subject');
     });
 
     it('rejects a token response with no ID token', async () => {
       const auth = createAuth();
-      const { stateId } = await startLogin(auth);
+      const { stateId, callback } = await startLogin(auth);
       tokenResponseOverride = body => {
         delete body.id_token;
         return body;
       };
 
-      await expect(auth.handleCallback('auth-code', stateId)).rejects.toThrow();
+      await expect(callback()).rejects.toThrow();
     });
 
     it('omits the token expiry when the provider sends no expires_in', async () => {
       const auth = createAuth();
-      const { stateId } = await startLogin(auth);
+      const { stateId, callback } = await startLogin(auth);
       tokenResponseOverride = body => {
         delete body.expires_in;
         return body;
       };
 
-      const result = await auth.handleCallback('auth-code', stateId);
+      const result = await callback();
       expect(result.tokens.expiresAt).toBeUndefined();
       // The cookie lifetime is independent of the access token lifetime.
       expect(result.cookies[0]).toContain('Max-Age=86400');
@@ -640,10 +754,10 @@ describe('MastraAuthOidc against a live OpenID Provider', () => {
 
     it('sends no client credentials when the auth method is none', async () => {
       const auth = createAuth({ tokenEndpointAuthMethod: 'none' });
-      const { stateId } = await startLogin(auth);
+      const { stateId, callback } = await startLogin(auth);
 
       // The provider is a confidential client, so it rejects the public-client call.
-      await expect(auth.handleCallback('auth-code', stateId)).rejects.toThrow();
+      await expect(callback()).rejects.toThrow();
       expect(lastTokenRequest?.get('client_id')).toBe(CLIENT_ID);
       expect(lastTokenRequest?.get('client_secret')).toBeNull();
     });

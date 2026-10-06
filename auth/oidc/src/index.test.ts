@@ -50,6 +50,14 @@ describe('MastraAuthOidc', () => {
       expect(auth.scopes).toEqual(['openid', 'profile', 'groups']);
     });
 
+    it('strips a trailing slash from the issuer', () => {
+      // A trailing slash makes openid-client's issuer comparison fail against
+      // path-based issuers such as Keycloak's `/realms/<name>`.
+      const auth = new MastraAuthOidc({ issuer: `${ISSUER}/`, clientId: 'mastra' });
+      expect(auth.getIssuer()).toBe(ISSUER);
+      expect(new MastraAuthOidc({ issuer: `${ISSUER}///`, clientId: 'mastra' }).getIssuer()).toBe(ISSUER);
+    });
+
     it('throws when the issuer is missing', () => {
       process.env.OIDC_CLIENT_ID = 'mastra';
       expect(() => new MastraAuthOidc()).toThrow('OIDC issuer is required');
@@ -109,6 +117,25 @@ describe('MastraAuthOidc', () => {
         expect(() => createSsoAuth({ session: undefined })).toThrow('OIDC_COOKIE_PASSWORD is required');
       } finally {
         process.env.NODE_ENV = nodeEnv;
+      }
+    });
+
+    it('treats a dev server as development even though it sets NODE_ENV=production', () => {
+      // `mastra dev` runs with NODE_ENV=production, so NODE_ENV alone would
+      // make the constructor throw and force Secure cookies on a plain-HTTP
+      // dev host. MASTRA_DEV is the signal that actually distinguishes them.
+      const nodeEnv = process.env.NODE_ENV;
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      process.env.NODE_ENV = 'production';
+      process.env.MASTRA_DEV = 'true';
+      try {
+        const auth = createSsoAuth({ session: undefined });
+        expect(warn).toHaveBeenCalled();
+        expect(auth.getClearSessionHeaders()['Set-Cookie']).not.toContain('Secure');
+      } finally {
+        process.env.NODE_ENV = nodeEnv;
+        delete process.env.MASTRA_DEV;
+        warn.mockRestore();
       }
     });
   });

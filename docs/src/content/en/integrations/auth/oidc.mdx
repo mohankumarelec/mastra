@@ -256,5 +256,7 @@ Visit [Mastra Client SDK](/docs/server/mastra-client) for more configuration opt
 - **401 with an `aud` mismatch**: the Bearer token's audience doesn't match. Set `audience` to the audience of the tokens you send. See [Authentication flow](#authentication-flow).
 - **`invalid_client` during the token exchange**: the client secret is wrong, or the provider expects a different client authentication method. See [Client authentication](#client-authentication).
 - **Logout doesn't redirect**: the provider publishes no `end_session_endpoint`. Add one through `serverMetadata` if the provider supports logout at a non-standard URL.
+- **`OIDC login was not started in this browser`**: the callback arrived without the short-lived login cookie. It happens when cookies are blocked, when login and callback run against different origins, or when a callback URL is replayed outside the original browser.
+- **`over the 4096-byte browser limit`**: your provider returns very large group or role claims. Use `mapClaims` to keep only the claims you need on the user.
 - **Cookies not sent cross-origin**: set `credentials: "include"` in `MastraClient` and configure `server.cors` with your frontend origin and `credentials: true`.
 - **Session lost on restart**: set `OIDC_COOKIE_PASSWORD` to a stable value of at least 32 characters.

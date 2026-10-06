@@ -32,6 +32,7 @@ import {
   buildAuthorizationUrl,
   buildEndSessionUrl,
   calculatePKCECodeChallenge,
+  customFetch,
   discovery,
   randomNonce,
   randomPKCECodeVerifier,
@@ -57,6 +58,12 @@ const STATE_TTL_SECONDS = 600;
 /** Timeout for provider HTTP requests, in seconds */
 const REQUEST_TIMEOUT_SECONDS = 10;
 
+/** Browsers drop cookies larger than roughly this many bytes. */
+const MAX_COOKIE_BYTES = 4096;
+
+/** Cap on in-flight logins awaiting their binding cookie. */
+const MAX_PENDING_BINDINGS = 100;
+
 /** Sealed into the OAuth state so the callback needs no server-side storage. */
 interface StatePayload extends JWTPayload {
   /** The state the Mastra server generated */
@@ -67,6 +74,8 @@ interface StatePayload extends JWTPayload {
   nonce: string;
   /** PKCE code verifier, when the provider supports PKCE */
   codeVerifier?: string;
+  /** Value that must also arrive as a cookie from the same browser */
+  binding: string;
 }
 
 /** Sealed into the session cookie. */
@@ -74,6 +83,30 @@ interface SessionPayload extends JWTPayload {
   user: OidcUser;
   /** Kept for `id_token_hint` on RP-initiated logout */
   idToken?: string;
+}
+
+/**
+ * Trim trailing slashes. Index scan instead of a regex to avoid backtracking
+ * (CodeQL js/polynomial-redos).
+ */
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === '/') end--;
+  return value.slice(0, end);
+}
+
+/**
+ * Whether this process is running a local development server.
+ *
+ * `mastra dev` sets NODE_ENV=production so builds behave consistently, so
+ * NODE_ENV alone would wrongly treat every dev server as production.
+ */
+function isDevServer(): boolean {
+  return process.env.MASTRA_DEV === 'true';
+}
+
+function isProduction(): boolean {
+  return process.env.NODE_ENV === 'production' && !isDevServer();
 }
 
 function parseScopes(value: string | undefined): string[] | undefined {
@@ -139,6 +172,9 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
   private cookiePassword: string;
   private secureCookies: boolean;
   private ssoEnabled: boolean;
+  private loginCookieName: string;
+  private pendingBindings = new Map<string, string>();
+  private callbackCookieHeader: string | null = null;
   private configPromise?: Promise<Configuration>;
   private keyPromise?: Promise<Uint8Array>;
   private jwks?: ReturnType<typeof createRemoteJWKSet>;
@@ -166,7 +202,7 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
     const cookiePassword =
       options?.session?.cookiePassword ?? process.env.OIDC_COOKIE_PASSWORD ?? crypto.randomUUID() + crypto.randomUUID();
 
-    this.issuer = issuer;
+    this.issuer = trimTrailingSlashes(issuer);
     this.clientId = clientId;
     this.clientSecret = clientSecret;
     this.serverMetadata = options?.serverMetadata;
@@ -178,9 +214,10 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
     this.mapClaims = options?.mapClaims ?? mapOidcClaimsToUser;
     this.redirectUri = options?.redirectUri ?? process.env.OIDC_REDIRECT_URI ?? null;
     this.cookieName = options?.session?.cookieName ?? DEFAULT_COOKIE_NAME;
+    this.loginCookieName = `${this.cookieName}_login`;
     this.cookieMaxAge = options?.session?.cookieMaxAge ?? DEFAULT_COOKIE_MAX_AGE;
     this.cookiePassword = cookiePassword;
-    this.secureCookies = options?.session?.secureCookies ?? process.env.NODE_ENV === 'production';
+    this.secureCookies = options?.session?.secureCookies ?? isProduction();
     this.ssoEnabled = !!clientSecret;
 
     if (this.ssoEnabled) {
@@ -193,7 +230,7 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
       if (!hasConfiguredCookiePassword) {
         const message =
           '[MastraAuthOidc] OIDC_COOKIE_PASSWORD is required for SSO in production. Set OIDC_COOKIE_PASSWORD or pass session.cookiePassword.';
-        if (process.env.NODE_ENV === 'production') {
+        if (isProduction()) {
           throw new Error(message);
         }
         console.warn(
@@ -283,6 +320,15 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
     return this.ssoEnabled;
   }
 
+  /**
+   * Receives the callback request's `Cookie` header from the host, which calls
+   * this immediately before `handleCallback`. Without it the login binding
+   * cookie can't be read and every callback is rejected.
+   */
+  setCallbackCookieHeader(cookieHeader: string | null): void {
+    this.callbackCookieHeader = cookieHeader;
+  }
+
   /** The configured issuer URL. */
   getIssuer(): string {
     return this.issuer;
@@ -316,6 +362,10 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
       ? new Configuration(this.serverMetadata, this.clientId, this.clientSecret, clientAuth)
       : await discovery(new URL(this.issuer), this.clientId, this.clientSecret, clientAuth, {
           execute: this.insecure ? [allowInsecureRequests] : undefined,
+          // `config.timeout` below only covers later requests, so the
+          // discovery fetch needs its own deadline.
+          [customFetch]: (url, options) =>
+            fetch(url, { ...options, signal: AbortSignal.timeout(REQUEST_TIMEOUT_SECONDS * 1000) }),
         });
 
     if (this.insecure && this.serverMetadata) {
@@ -346,6 +396,37 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
   private cookieFlags(maxAge: number): string {
     const flags = `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`;
     return this.secureCookies ? `${flags}; Secure` : flags;
+  }
+
+  /**
+   * Seal the session into a `Set-Cookie` value.
+   *
+   * Browsers silently discard cookies over ~4KB, which would show up as an
+   * endless redirect back to login rather than an error. Providers that put
+   * large group or role lists in the ID token (Keycloak, Entra ID) can reach
+   * that size, so the ID token is dropped before the cookie is lost, and an
+   * oversized session fails loudly instead.
+   */
+  private async buildSessionCookie(user: OidcUser, idToken?: string): Promise<string> {
+    const key = await this.getKey();
+    const build = async (payload: SessionPayload) =>
+      `${this.cookieName}=${await seal(payload, key, this.cookieMaxAge, SEAL_SESSION)}; ${this.cookieFlags(this.cookieMaxAge)}`;
+
+    let cookie = await build({ user, idToken });
+    if (cookie.length > MAX_COOKIE_BYTES && idToken) {
+      this.logger.warn(
+        `OIDC session cookie was ${cookie.length} bytes, over the ${MAX_COOKIE_BYTES}-byte browser limit. Dropping the ID token from the session; provider-initiated logout will not send id_token_hint.`,
+      );
+      cookie = await build({ user });
+    }
+
+    if (cookie.length > MAX_COOKIE_BYTES) {
+      throw new Error(
+        `OIDC session cookie is ${cookie.length} bytes, over the ${MAX_COOKIE_BYTES}-byte browser limit, even without the ID token. Use mapClaims to keep fewer claims on the user.`,
+      );
+    }
+
+    return cookie;
   }
 
   /** Decrypt the session cookie. Expiry is enforced by the sealed token's `exp`. */
@@ -387,7 +468,18 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
           parameters.code_challenge_method = 'S256';
         }
 
-        const payload: StatePayload = { state, redirectUri: actualRedirectUri, nonce, codeVerifier };
+        // Binds this login to the browser that started it. The same value is
+        // sealed into the state and handed back as a cookie, so a callback
+        // replayed into someone else's browser has no matching cookie.
+        const binding = randomNonce();
+        this.pendingBindings.set(state, binding);
+        if (this.pendingBindings.size > MAX_PENDING_BINDINGS) {
+          // A host that never calls getLoginCookies would otherwise grow this
+          // map without bound; drop the oldest entry.
+          this.pendingBindings.delete(this.pendingBindings.keys().next().value!);
+        }
+
+        const payload: StatePayload = { state, redirectUri: actualRedirectUri, nonce, codeVerifier, binding };
         const sealed = await seal(payload, await this.getKey(), STATE_TTL_SECONDS, SEAL_STATE);
         // The Mastra server appends its post-login redirect after a `|`.
         parameters.state = `${sealed}${stateSuffix(state)}`;
@@ -396,12 +488,22 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
       },
 
       handleCallback: async (code: string, callbackState: string): Promise<SSOCallbackResult<OidcUser>> => {
+        // Read synchronously, before the first await: the host sets this
+        // immediately before calling us, so taking it now leaves no window for
+        // a concurrent callback to swap in its own cookies.
+        const presentedBinding = readCookie(this.callbackCookieHeader, this.loginCookieName);
+        this.callbackCookieHeader = null;
+
         const sealed = stateToken(callbackState);
-        const { state, redirectUri, nonce, codeVerifier } = await unseal<StatePayload>(
+        const { state, redirectUri, nonce, codeVerifier, binding } = await unseal<StatePayload>(
           sealed,
           await this.getKey(),
           SEAL_STATE,
         );
+
+        if (!presentedBinding || presentedBinding !== binding) {
+          throw new Error('OIDC login was not started in this browser');
+        }
 
         const suffix = stateSuffix(callbackState);
         if (suffix && suffix !== stateSuffix(state)) {
@@ -434,8 +536,7 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
           throw new Error('OIDC ID token is missing a subject');
         }
 
-        const session: SessionPayload = { user, idToken: tokens.id_token };
-        const cookie = await seal(session, await this.getKey(), this.cookieMaxAge, SEAL_SESSION);
+        const sessionCookie = await this.buildSessionCookie(user, tokens.id_token);
         const expiresIn = tokens.expiresIn();
 
         return {
@@ -446,7 +547,8 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
             idToken: tokens.id_token,
             expiresAt: expiresIn ? new Date(Date.now() + expiresIn * 1000) : undefined,
           },
-          cookies: [`${this.cookieName}=${cookie}; ${this.cookieFlags(this.cookieMaxAge)}`],
+          // The login binding has served its purpose; expire it immediately.
+          cookies: [sessionCookie, `${this.loginCookieName}=; ${this.cookieFlags(0)}`],
         };
       },
 
@@ -471,7 +573,11 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
         description: `Sign in using your ${this.label} account`,
       }),
 
-      getLoginCookies: () => [],
+      getLoginCookies: (_redirectUri: string, state: string) => {
+        const binding = this.pendingBindings.get(state);
+        this.pendingBindings.delete(state);
+        return binding ? [`${this.loginCookieName}=${binding}; ${this.cookieFlags(STATE_TTL_SECONDS)}`] : [];
+      },
     };
   }
 

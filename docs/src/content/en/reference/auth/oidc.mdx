@@ -242,6 +242,12 @@ After authentication, `authorizeUser` accepts any user that has an `id`. Pass yo
 
 The login flow runs the authorization code grant through `openid-client`, with an OIDC `nonce` and Proof Key for Code Exchange (PKCE) when the provider advertises `code_challenge_methods_supported`. The `state` parameter is an encrypted token carrying the nonce, redirect URI, and PKCE verifier, so no login state is held in server memory and the flow survives restarts and multiple instances.
 
+Starting a login also sets a short-lived `{cookieName}_login` cookie. The callback must present it, which ties the login to the browser that began it and stops an attacker from completing their own login inside someone else's session. The cookie is cleared as soon as the callback succeeds.
+
+### Session cookie size
+
+The session cookie holds the mapped user and the ID token, the latter only so logout can send `id_token_hint`. Browsers discard cookies larger than 4096 bytes, so when a provider returns a large ID token (Keycloak group lists and Entra ID role lists are common causes) the ID token is dropped from the cookie and a warning is logged; logout then omits the hint. If the mapped user alone still exceeds the limit, the login fails with an error rather than setting a cookie the browser would silently throw away. Use `mapClaims` to keep fewer claims when that happens.
+
 ### `OidcUser` type
 
 `OidcUser` extends the base `EEUser` interface:
