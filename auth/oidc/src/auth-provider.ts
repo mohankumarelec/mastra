@@ -512,11 +512,26 @@ export class MastraAuthOidc extends MastraAuthProvider<OidcUser> implements IUse
 
         // openid-client reads the grant parameters off the callback URL and
         // derives redirect_uri from it, so rebuild the URL the provider used.
+        const config = await this.getConfig();
+        const metadata = config.serverMetadata();
         const currentUrl = new URL(redirectUri);
         currentUrl.searchParams.set('code', code);
         currentUrl.searchParams.set('state', sealed);
 
-        const tokens = await authorizationCodeGrant(await this.getConfig(), currentUrl, {
+        // Providers that implement RFC 9207 (Keycloak among them) return an
+        // `iss` parameter, and openid-client rejects the response when the
+        // metadata advertises it but the parameter is absent. Hosts hand us
+        // only `code` and `state`, so the original value never reaches us and
+        // is restored from the resolved metadata. That costs nothing here: the
+        // parameter exists to stop mix-up attacks against clients configured
+        // with several authorization servers, and this provider is bound to
+        // exactly one issuer, whose `iss` claim is still verified on the ID
+        // token and whose token endpoint is the only one a code is sent to.
+        if (metadata.authorization_response_iss_parameter_supported) {
+          currentUrl.searchParams.set('iss', metadata.issuer);
+        }
+
+        const tokens = await authorizationCodeGrant(config, currentUrl, {
           expectedState: sealed,
           expectedNonce: nonce,
           pkceCodeVerifier: codeVerifier,

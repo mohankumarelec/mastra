@@ -242,6 +242,8 @@ After authentication, `authorizeUser` accepts any user that has an `id`. Pass yo
 
 The login flow runs the authorization code grant through `openid-client`, with an OIDC `nonce` and Proof Key for Code Exchange (PKCE) when the provider advertises `code_challenge_methods_supported`. The `state` parameter is an encrypted token carrying the nonce, redirect URI, and PKCE verifier, so no login state is held in server memory and the flow survives restarts and multiple instances.
 
+Providers that implement RFC 9207 return an `iss` parameter on the callback. Mastra forwards only `code` and `state` to the provider, so `iss` is restored from the resolved metadata before the token exchange. Keycloak advertises this parameter and rejects the flow without it.
+
 Starting a login also sets a short-lived `{cookieName}_login` cookie. The callback must present it, which ties the login to the browser that began it and stops an attacker from completing their own login inside someone else's session. The cookie is cleared as soon as the callback succeeds.
 
 ### Session cookie size

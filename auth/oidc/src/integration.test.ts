@@ -34,6 +34,12 @@ let lastTokenRequest: URLSearchParams | undefined;
 let idTokenClaims: Record<string, unknown> = {};
 /** Lets a test drop `code_challenge_methods_supported` from discovery. */
 let advertisePKCE = true;
+/**
+ * Whether the provider implements RFC 9207, as Keycloak does. Defaults on so
+ * the common path is exercised: hosts hand the provider only `code` and
+ * `state`, so the `iss` parameter has to be restored before the grant.
+ */
+let advertiseIssParam = true;
 /** Authorization codes already redeemed, so replays can be rejected. */
 let usedCodes = new Set<string>();
 /** Lets a test reshape the provider's token response. */
@@ -90,6 +96,7 @@ beforeAll(async () => {
         id_token_signing_alg_values_supported: ['RS256'],
         token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic'],
         ...(advertisePKCE ? { code_challenge_methods_supported: ['S256'] } : {}),
+        authorization_response_iss_parameter_supported: advertiseIssParam,
       });
     }
 
@@ -139,6 +146,7 @@ afterAll(async () => {
 
 beforeEach(() => {
   advertisePKCE = true;
+  advertiseIssParam = true;
   lastTokenRequest = undefined;
   idTokenClaims = {};
   usedCodes = new Set();
@@ -323,6 +331,26 @@ describe('MastraAuthOidc against a live OpenID Provider', () => {
     await expect(callback('auth-code', `${stateId}|%2F%2Fevil.example.com`)).rejects.toThrow(
       'Invalid state redirect suffix',
     );
+  });
+
+  describe('RFC 9207 issuer response parameter', () => {
+    it('completes the login when the provider advertises the iss parameter', async () => {
+      // Keycloak sets authorization_response_iss_parameter_supported, and the
+      // Mastra server forwards only `code` and `state`, dropping `iss`.
+      // Without restoring it the grant fails for every such provider.
+      const auth = createAuth();
+      const { callback } = await startLogin(auth);
+
+      await expect(callback()).resolves.toMatchObject({ user: { id: 'user-42' } });
+    });
+
+    it('completes the login when the provider does not advertise it', async () => {
+      advertiseIssParam = false;
+      const auth = createAuth();
+      const { callback } = await startLogin(auth);
+
+      await expect(callback()).resolves.toMatchObject({ user: { id: 'user-42' } });
+    });
   });
 
   describe('login binding to the initiating browser', () => {
