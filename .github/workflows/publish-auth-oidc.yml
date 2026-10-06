@@ -1,0 +1,105 @@
+name: Publish auth-oidc
+
+# Publishes auth/oidc to npm under a community scope using npm Trusted
+# Publishing (OIDC) — no NPM_TOKEN secret is involved.
+#
+# One-time setup is required on npmjs.com before the first OIDC run; see
+# auth/oidc/PUBLISHING.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, e.g. 0.1.0'
+        required: true
+        type: string
+      dry_run:
+        description: 'Build and pack only, do not publish'
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - 'auth-oidc-v*'
+
+concurrency:
+  group: publish-auth-oidc
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Must be a GitHub-hosted runner: npm Trusted Publishing does not support
+    # self-hosted runners, and a fork cannot reach this repo's private pool.
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for npm to mint an OIDC token. Without it, npm silently falls
+      # back to token auth and fails with a confusing 404.
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="${GITHUB_REF_NAME#auth-oidc-v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing version $version"
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Ensure npm supports trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile --filter "@mastra/auth-oidc..."
+
+      - name: Build
+        run: pnpm turbo build --filter @mastra/auth-oidc
+
+      - name: Test
+        run: pnpm --filter @mastra/auth-oidc test
+
+      - name: Rewrite manifest for the community scope
+        env:
+          PUBLISH_VERSION: ${{ steps.version.outputs.value }}
+          PUBLISH_REPO: ${{ github.repository }}
+        run: node auth/oidc/scripts/prepare-community-publish.mjs
+
+      - name: Inspect tarball
+        working-directory: auth/oidc
+        run: npm pack --dry-run
+
+      - name: Publish
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        working-directory: auth/oidc
+        # No NODE_AUTH_TOKEN on purpose: publishing must go through OIDC, and
+        # omitting the token makes a misconfigured trusted publisher fail loudly.
+        run: npm publish
+
+      - name: Confirm the release used trusted publishing
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          name=$(node -p "require('./auth/oidc/package.json').name")
+          sleep 10
+          publisher=$(curl -fsSL "https://registry.npmjs.org/${name//\//%2F}" \
+            | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).versions['$VERSION']?._npmUser?.name ?? 'unknown'")
+          echo "Published $name@$VERSION as: $publisher"
+          if [ "$publisher" != "GitHub Actions" ]; then
+            echo "::warning::Expected '_npmUser' to be 'GitHub Actions'. npm may have fallen back to token auth."
+          fi
